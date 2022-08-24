@@ -6,7 +6,6 @@ where
 
 import qualified Data.Text as T
 import System.FilePath (takeExtension)
-import Prelude
 
 data Options = Options
   { optInput :: !FilePath,

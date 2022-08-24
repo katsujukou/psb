@@ -37,6 +37,7 @@ common shared-properties
     , random
     , serialise
     , text
+    , time
     , transformers
 
   ghc-options:
@@ -47,7 +48,6 @@ common shared-properties
     -optP-Wno-nonportable-include-path
 
   default-extensions:
-    NoImplicitPrelude
     ApplicativeDo
     BangPatterns
     BlockArguments
@@ -113,10 +113,13 @@ executable psb
 library
   import:          shared-properties
   hs-source-dirs:  src
+  other-modules:   Paths_psb
 
   -- cabal-fmt: expand src
   exposed-modules:
-    Control.Monad.Except
     Pursley.Psb
+    Pursley.Psb.Depfile
     Pursley.Psb.Error
+    Pursley.Psb.IO
     Pursley.Psb.Options
+    Pursley.Psb.Version

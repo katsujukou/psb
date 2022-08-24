@@ -1,4 +1,4 @@
-module Psb where
+module Psb (main) where
 
 import Control.Applicative (many)
 import qualified Data.Text as T
@@ -6,9 +6,7 @@ import qualified Options.Applicative as Opts
 import Pursley.Psb (runPsb)
 import Pursley.Psb.Options (mkOptions)
 import System.Exit (exitFailure)
-import System.FilePath (takeExtension)
 import qualified System.IO as IO
-import Prelude
 
 main :: IO ()
 main = do

@@ -4,43 +4,38 @@ module Pursley.Psb
   )
 where
 
+-- import Codec.Serialise (serialise)
+
 import Codec.Serialise (serialise)
-import Control.Exception (throwIO)
-import Control.Lens.Combinators (over, _Left, _Nothing, _Right)
-import Control.Monad (foldM, forM, join, when, (<=<))
-import Control.Monad.Error.Class (MonadError (throwError))
-import Control.Monad.Except (mapError, runExceptT)
+import Control.Lens.Combinators (over, _Left, _Right)
+import Control.Monad (forM, join, when, (<=<))
+import Control.Monad.Error.Class (MonadError, throwError)
+import Control.Monad.Except (runExceptT)
 import Control.Monad.IO.Class (MonadIO (liftIO))
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Except (ExceptT (ExceptT))
-import Control.Monad.Trans.Writer (WriterT (runWriterT))
-import Control.Monad.Writer.Class (MonadWriter, tell)
-import Data.Bifunctor (Bifunctor (first))
+import Control.Monad.Writer.Class (tell)
 import qualified Data.ByteString as BS
 import qualified Data.List as L
 import qualified Data.Map as M
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, maybeToList)
 import qualified Data.Set as S
-import Data.String (IsString (fromString))
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import qualified Data.Text.IO as TIO
 import qualified Language.PureScript as PS
-import qualified Language.PureScript.CST as PS (parseFromFile, parseModuleFromFile)
+import qualified Language.PureScript.CST as PS (parseFromFile)
 import qualified Language.PureScript.CodeGen.JS as J
 import qualified Language.PureScript.CodeGen.JS.Printer as JS
 import qualified Language.PureScript.CoreFn as CF
 import qualified Language.PureScript.Docs.Types as Docs
-import qualified Language.PureScript.PSString as PSS
-import qualified Paths_psb as Paths
+import Pursley.Psb.Depfile (DepFile (..), depfilename, openDepfile)
 import Pursley.Psb.Error (PsbError (..))
+import Pursley.Psb.IO (openBinaryFile, saveBinaryFile)
 import Pursley.Psb.Options (Options (..))
+import Pursley.Psb.Version (pursVersion)
 import System.Directory (createDirectoryIfMissing, getModificationTime)
-import qualified System.Directory as Directory
 import System.Exit (exitFailure, exitSuccess)
-import System.FilePath (isPathSeparator, pathSeparator, takeDirectory, takeExtension, (</>))
+import System.FilePath (isPathSeparator, takeDirectory, takeExtension, (</>))
 import qualified System.IO as IO
-import Prelude
 
 build ::
   forall m.
@@ -59,13 +54,8 @@ build ::
   FilePath ->
   m ()
 build input outputDir ffi exts sourcemap cacheDir = do
-  -- Step1. ExternsFile読み込み
-  externs <- do
-    extsOrErr <- runExceptT $ catMaybes <$> forM exts PS.readExternsFile
-    case extsOrErr of
-      Left errs -> throwError $ PursError errs
-      Right externs -> pure externs
-
+  -- Step1. DepFile作成
+  depfile <- mkDepfile input ffi exts
   -- Step2. inputをパース
   m@(PS.Module _ _ mn _ _) <- do
     parseRes <- runExceptT do
@@ -75,31 +65,51 @@ build input outputDir ffi exts sourcemap cacheDir = do
     case join . over _Right (over _Left PursParseErrors) . over _Left PursError $ parseRes of
       Left err -> throwError err
       Right res -> pure res
-
-  let makeActions =
-        (PS.buildMakeActions "sample/output" (M.fromList [(mn, Left PS.RebuildAlways)]) M.empty False)
-          { PS.getOutputTimestamp = const (pure Nothing),
-            PS.progress = const (pure ()),
-            PS.codegen = codegen,
-            PS.ffiCodegen = ffiCodegen
-          }
-      makeOpts =
-        PS.defaultOptions
-          { PS.optionsNoComments = True,
-            PS.optionsCodegenTargets = S.fromList [PS.JS, PS.JSSourceMap]
-          }
-  do
-    makeRes <- liftIO $ PS.runMake makeOpts $ PS.rebuildModule makeActions externs m
-    -- liftIO $ IO.print makeRes
-    pure ()
+  -- Step3. 既存のDepFileを読み込み（あれば）
+  let depfilepath = outputDirectory input </> T.unpack (PS.runModuleName mn) </> Pursley.Psb.Depfile.depfilename
+  currentDepfile <- Pursley.Psb.Depfile.openDepfile depfilepath
+  -- DepFileに差異がなければ再ビルドの必要がない
+  if currentDepfile == Just depfile
+    then do
+      liftIO $ IO.putStrLn "Up to date"
+      pure ()
+    else do
+      -- Step4. ExternsFile読み込み
+      externs <- do
+        extsOrErr <- runExceptT $ catMaybes <$> forM exts PS.readExternsFile
+        case extsOrErr of
+          Left errs -> throwError $ PursError errs
+          Right externs -> pure externs
+      -- Step5. Buildアクションを用意
+      let makeActions =
+            (PS.buildMakeActions "sample/output" (M.fromList [(mn, Left PS.RebuildAlways)]) M.empty False)
+              { PS.getOutputTimestamp = const (pure Nothing),
+                PS.progress = const (pure ()),
+                PS.codegen = codegen depfilepath depfile,
+                PS.ffiCodegen = ffiCodegen
+              }
+          makeOpts =
+            PS.defaultOptions
+              { PS.optionsNoComments = True,
+                PS.optionsCodegenTargets = S.fromList [PS.JS, PS.JSSourceMap]
+              }
+      -- Step6. Buildアクション実行
+      liftIO do
+        res <- PS.runMake makeOpts $ PS.rebuildModule makeActions externs m
+        IO.print res
+        pure ()
   where
-    codegen :: CF.Module CF.Ann -> Docs.Module -> PS.ExternsFile -> PS.SupplyT PS.Make ()
-    codegen m _ exts = do
+    mkDepfile :: FilePath -> Maybe FilePath -> [FilePath] -> m Pursley.Psb.Depfile.DepFile
+    mkDepfile i f e =
+      let filepaths = i : maybeToList f ++ e
+          deps = liftIO $ forM filepaths \fp -> (fp,) <$> getModificationTime fp
+       in Pursley.Psb.Depfile.DepFile pursVersion <$> deps
+
+    codegen :: FilePath -> DepFile -> CF.Module CF.Ann -> Docs.Module -> PS.ExternsFile -> PS.SupplyT PS.Make ()
+    codegen depfilepath depfile m _ ext = do
       let mn = CF.moduleName m
-          outputDir' = outputDirectory m
-      -- lift $ liftIO $ IO.print outputDir'
       foreignInclude <- case ffi of
-        Just ffiJs
+        Just _
           | not $ requiresForeign m -> do
               return Nothing
           | otherwise -> do
@@ -109,7 +119,7 @@ build input outputDir ffi exts sourcemap cacheDir = do
           | otherwise -> return Nothing
       rawJs <- J.moduleToJs m foreignInclude
       -- dir <- lift $ makeIO "get the current directory" getCurrentDirectory
-      let (js, mappings) = {-if sourcemap then prettyPrintJSWithSourceMaps rawJs else-} (JS.prettyPrintJS rawJs, [])
+      let (js, _) = {-if sourcemap then prettyPrintJSWithSourceMaps rawJs else-} (JS.prettyPrintJS rawJs, [])
           jsFile = outputFilename m "index.js"
           -- mapFile = outputFIlename mn "index.js.map"
           -- prefix = ["Generated by psb version " <> T.pack (showVersion Paths.version) | usePrefix]
@@ -121,9 +131,14 @@ build input outputDir ffi exts sourcemap cacheDir = do
 
       -- externs fileを現存と差分がある場合のみ出力する
       let externsFilename = outputFilename m "externs.cbor"
-      -- currentExterns <- lift $ PS.readExternsFile externsFilename
-      -- when ((serialise <$> currentExterns) /= Just (serialise exts)) do
-      lift $ PS.writeCborFile externsFilename exts
+          newExternsCbor = BS.toStrict $ serialise ext
+      currentExternsCbor <- lift $ readBinaryFile externsFilename
+      when (currentExternsCbor /= Just newExternsCbor) do
+        lift $ writeBinaryFile externsFilename newExternsCbor
+
+      -- depfileを出力する
+      lift $ do
+        PS.writeCborFile depfilepath depfile
 
     ffiCodegen :: CF.Module CF.Ann -> PS.Make ()
     ffiCodegen m = do
@@ -141,11 +156,18 @@ build input outputDir ffi exts sourcemap cacheDir = do
           | requiresForeign m -> throwError . PS.errorMessage' (CF.moduleSourceSpan m) $ PS.MissingFFIModule mn
           | otherwise -> return ()
 
-    outputDirectory :: CF.Module CF.Ann -> FilePath
+    readBinaryFile :: FilePath -> PS.Make (Maybe BS.ByteString)
+    readBinaryFile fp = do
+      PS.makeIO ("read Binary file as Bytestring: " <> T.pack fp) (openBinaryFile fp)
+
+    writeBinaryFile :: FilePath -> BS.ByteString -> PS.Make ()
+    writeBinaryFile fp value = do
+      PS.makeIO ("write Bytestring as Binary file: " <> T.pack fp) (saveBinaryFile fp value)
+
+    outputDirectory :: FilePath -> FilePath
     outputDirectory =
       maybe outputDir ((cacheDir </>) . (</> "output"))
         . ((safeHead . wordsWhen isPathSeparator) <=< L.stripPrefix cacheDir)
-        . CF.modulePath
 
     wordsWhen :: (Char -> Bool) -> String -> [String]
     wordsWhen p s = case dropWhile p s of
@@ -161,7 +183,7 @@ build input outputDir ffi exts sourcemap cacheDir = do
     outputFilename :: CF.Module CF.Ann -> String -> FilePath
     outputFilename m fn =
       let mn = T.unpack . PS.runModuleName . CF.moduleName $ m
-       in outputDirectory m </> mn </> fn
+       in outputDirectory (CF.modulePath m) </> mn </> fn
 
 -- when (S.member Docs codegenTargets) $ do
 --   lift $ writeJSONFile (outputFilename mn "docs.json") docs
@@ -182,8 +204,8 @@ runPsb (Options input ffi externs outdir sourcemaps cacheDir) = do
   res <- runExceptT $ do
     build input outdir ffi externs sourcemaps cacheDir
   case res of
-    Right r -> do
+    Right _ -> do
       exitSuccess
     Left errs -> do
-      -- print errs
+      print errs
       exitFailure
